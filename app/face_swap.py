@@ -1,4 +1,6 @@
 from pathlib import Path
+import os
+
 import cv2
 import numpy as np
 import insightface
@@ -10,6 +12,59 @@ try:
     HAVE_SKIMAGE = True
 except ImportError:
     HAVE_SKIMAGE = False
+
+# ====================== Глобальная оптимизация OpenCV ======================
+
+cv2.setUseOptimized(True)
+try:
+    # ограничимся 4 потоками, чтобы не убивать систему
+    cv2.setNumThreads(min(4, os.cpu_count() or 4))
+except Exception:
+    pass
+
+
+# =====================================================================
+# ------------------------- ONNX UTILS --------------------------------
+# =====================================================================
+
+def get_onnx_providers():
+    """
+    Выбираем максимально быстрые доступные провайдеры.
+    Если есть OpenVINOExecutionProvider — используем его + CPU.
+    Иначе — только CPUExecutionProvider.
+    """
+    available = ort.get_available_providers()
+    providers = []
+
+    if "OpenVINOExecutionProvider" in available:
+        providers.append("OpenVINOExecutionProvider")
+
+    if "CPUExecutionProvider" in available:
+        providers.append("CPUExecutionProvider")
+
+    if not providers:
+        providers = ["CPUExecutionProvider"]
+
+    return providers
+
+
+def create_onnx_session(onnx_path: str) -> ort.InferenceSession:
+    """
+    Создаёт InferenceSession с включённой максимальной оптимизацией графа.
+    """
+    sess_options = ort.SessionOptions()
+    level = getattr(
+        ort.GraphOptimizationLevel,
+        "ORT_ENABLE_ALL",
+        ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    )
+    sess_options.graph_optimization_level = level
+
+    return ort.InferenceSession(
+        onnx_path,
+        sess_options=sess_options,
+        providers=get_onnx_providers()
+    )
 
 
 # =====================================================================
@@ -52,7 +107,7 @@ def safe_letterbox_to_512(img):
 def color_match_hist(dst_face, src_face):
     """
     Приводим enhanced-лицо (src_face) к цветам оригинального лица (dst_face).
-    Если skimage нет — fallback на старый LAB-transfer.
+    Если skimage нет — fallback на LAB-transfer.
     """
     if HAVE_SKIMAGE:
         matched = match_histograms(src_face, dst_face, channel_axis=-1)
@@ -71,9 +126,10 @@ def color_match_hist(dst_face, src_face):
     return cv2.cvtColor(dst_norm, cv2.COLOR_LAB2BGR)
 
 
-def make_ellipse_mask(h, w, blur_ksize=101, blur_sigma=40, erode_px=20):
+def make_ellipse_mask(h, w, blur_ksize=51, blur_sigma=20, erode_px=10):
     """
-    Эллиптическая маска + эрозия + сильный blur для мягких границ.
+    Эллиптическая маска + эрозия + blur для мягких границ.
+    Уменьшены размеры ядра и sigma, чтобы не грузить CPU.
     """
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.ellipse(
@@ -88,6 +144,10 @@ def make_ellipse_mask(h, w, blur_ksize=101, blur_sigma=40, erode_px=20):
         k = max(1, erode_px)
         kernel = np.ones((k, k), np.uint8)
         mask = cv2.erode(mask, kernel, iterations=1)
+
+    # blur_ksize должен быть нечётный
+    if blur_ksize % 2 == 0:
+        blur_ksize += 1
 
     mask = cv2.GaussianBlur(mask, (blur_ksize, blur_ksize), blur_sigma)
     return mask
@@ -122,11 +182,8 @@ def adaptive_sharpen(face_bgr):
 # =====================================================================
 
 class RealESRGAN_ONNX:
-    def __init__(self, onnx_path):
-        self.sess = ort.InferenceSession(
-            onnx_path,
-            providers=["CPUExecutionProvider"]
-        )
+    def __init__(self, onnx_path: str):
+        self.sess = create_onnx_session(onnx_path)
         self.input_name = self.sess.get_inputs()[0].name
 
     def upscale(self, img):
@@ -152,11 +209,12 @@ class FaceSwapEngine:
     def __init__(self):
         print("[FaceSwap] Initializing FaceAnalysis...")
 
+        # Используем более мелкий размер детекции — сильный буст по скорости
         self.face_app = insightface.app.FaceAnalysis(
             name="buffalo_l",
-            providers=["CPUExecutionProvider"],
+            providers=get_onnx_providers(),
         )
-        self.face_app.prepare(ctx_id=0, det_size=(640, 640))
+        self.face_app.prepare(ctx_id=0, det_size=(320, 320))
         print("[FaceSwap] FaceAnalysis loaded")
 
         # ---------------------- InSwapper -----------------------
@@ -167,7 +225,7 @@ class FaceSwapEngine:
         print(f"[FaceSwap] Loading InSwapper: {model_path}")
         self.swapper = insightface.model_zoo.get_model(
             str(model_path),
-            providers=["CPUExecutionProvider"],
+            providers=get_onnx_providers(),
             download=False,
             download_zip=False,
         )
@@ -205,11 +263,19 @@ class FaceSwapEngine:
         """
         Внутренний шаг: GFPGAN + (опционально ESRGAN) + color match + sharpen.
         На входе: кроп из уже свапнутого изображения.
+
+        Оптимизация:
+        - Для крупных лиц (>= 220px) пропускаем тяжёлый GFPGAN/ESRGAN
+          и делаем только быстрый adaptive_sharpen.
         """
         h, w = face_patch.shape[:2]
         if h < 40 or w < 40:
             print("[Enhance] face too small, skipping")
             return face_patch
+
+        # Быстрый путь для больших лиц — только шарпинг
+        if max(h, w) >= 220:
+            return adaptive_sharpen(face_patch)
 
         # 1) letterbox → 512
         face_512, meta = safe_letterbox_to_512(face_patch)
@@ -220,9 +286,9 @@ class FaceSwapEngine:
         else:
             gfp_512 = face_512
 
-        # 3) ESRGAN ×2/×4 (если подключён)
+        # 3) ESRGAN ×4 (если подключён) — можно при желании отключить
         if self.esr:
-            upscaled = gfp_512 #self.esr.upscale(gfp_512)
+            upscaled = self.esr.upscale(gfp_512)
         else:
             upscaled = gfp_512
 
@@ -245,8 +311,8 @@ class FaceSwapEngine:
 
         # 8) мягкое смешивание с оригиналом (чтобы не было “переполировки”)
         out = (
-                face_patch.astype(np.float32) * 0.70 +  # more original, less artifacts
-                sharpened.astype(np.float32) * 0.30
+            face_patch.astype(np.float32) * 0.70 +  # more original, less artifacts
+            sharpened.astype(np.float32) * 0.30
         )
         return np.clip(out, 0, 255).astype(np.uint8)
 
@@ -279,7 +345,7 @@ class FaceSwapEngine:
         if not self.gfpgan and not self.esr:
             return swapped_full
 
-        # ----------------- ENHANCEMENT + POISSON BLEND ---------------
+        # ----------------- ENHANCEMENT + FAST BLEND ---------------
         try:
             x1, y1, x2, y2 = dst_face.bbox.astype(int)
 
@@ -296,23 +362,20 @@ class FaceSwapEngine:
 
             ph, pw = enhanced_patch.shape[:2]
 
-            # Маска для seamlessClone (одноканальная, 8-бит, 0–255)
+            # Маска для alpha-blend (одноканальная, 8-бит, 0–255)
             mask = make_ellipse_mask(ph, pw)
-            mask_uint8 = np.clip(mask, 0, 255).astype(np.uint8)
+            alpha = (mask.astype(np.float32) / 255.0)[..., None]  # H×W×1
 
-            # center – центр bbox
-            center = ((x1 + x2) // 2, (y1 + y2) // 2)
+            # быстрый альфа-блендинг вместо медленного seamlessClone
+            roi = swapped_full[y1:y2, x1:x2].astype(np.float32)
+            enh = enhanced_patch.astype(np.float32)
 
-            # Poisson blending: встраиваем enhanced_patch прямо в swapped_full
-            result = cv2.seamlessClone(
-                enhanced_patch,
-                swapped_full,
-                mask_uint8,
-                center,
-                cv2.NORMAL_CLONE  # либо MIXED_CLONE
-            )
+            blended = enh * alpha + roi * (1.0 - alpha)
+            blended = np.clip(blended, 0, 255).astype(np.uint8)
 
-            return result
+            swapped_full[y1:y2, x1:x2] = blended
+
+            return swapped_full
 
         except Exception as e:
             print("[FaceSwap] enhancement/blending error:", e)

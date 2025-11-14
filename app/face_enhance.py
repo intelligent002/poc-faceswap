@@ -1,19 +1,19 @@
+import onnxruntime as ort
 import cv2
 import numpy as np
-import onnxruntime as ort
+
+from . import face_swap  # если не нравится такой импорт – можно скопировать create_onnx_session сюда
 
 
 class FaceEnhancer:
     """
-    Wrapper over GFPGANv1.4.onnx (CPU-only)
+    Wrapper over GFPGANv1.4.onnx (CPU/OpenVINO)
     Requires input exactly (512,512,3)
     """
 
     def __init__(self, model_path: str):
-        self.sess = ort.InferenceSession(
-            model_path,
-            providers=["CPUExecutionProvider"]
-        )
+        # Используем ту же фабрику с граф-оптимизацией и OpenVINO (если есть)
+        self.sess = face_swap.create_onnx_session(model_path)
         self.input_name = self.sess.get_inputs()[0].name
 
     def enhance_face(self, img512):
@@ -35,7 +35,7 @@ class FaceEnhancer:
             face = cv2.cvtColor(img512, cv2.COLOR_BGR2RGB)
             face = face.astype(np.float32) / 255.0
             face = np.transpose(face, (2, 0, 1))  # CHW
-            face = np.expand_dims(face, 0)         # 1x3x512x512
+            face = np.expand_dims(face, 0)        # 1x3x512x512
 
             # Inference
             out = self.sess.run(None, {self.input_name: face})[0]
