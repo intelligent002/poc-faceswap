@@ -1,8 +1,33 @@
-import onnxruntime as ort
 import cv2
 import numpy as np
+import onnxruntime as ort
 
-from . import face_swap  # если не нравится такой импорт – можно скопировать create_onnx_session сюда
+
+def _get_onnx_providers():
+    available = ort.get_available_providers()
+    providers = []
+    if "OpenVINOExecutionProvider" in available:
+        providers.append("OpenVINOExecutionProvider")
+    if "CPUExecutionProvider" in available:
+        providers.append("CPUExecutionProvider")
+    if not providers:
+        providers = ["CPUExecutionProvider"]
+    return providers
+
+
+def _create_onnx_session(onnx_path: str) -> ort.InferenceSession:
+    sess_options = ort.SessionOptions()
+    level = getattr(
+        ort.GraphOptimizationLevel,
+        "ORT_ENABLE_ALL",
+        ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+    )
+    sess_options.graph_optimization_level = level
+    return ort.InferenceSession(
+        onnx_path,
+        sess_options=sess_options,
+        providers=_get_onnx_providers()
+    )
 
 
 class FaceEnhancer:
@@ -12,8 +37,7 @@ class FaceEnhancer:
     """
 
     def __init__(self, model_path: str):
-        # Используем ту же фабрику с граф-оптимизацией и OpenVINO (если есть)
-        self.sess = face_swap.create_onnx_session(model_path)
+        self.sess = _create_onnx_session(model_path)
         self.input_name = self.sess.get_inputs()[0].name
 
     def enhance_face(self, img512):
@@ -22,7 +46,6 @@ class FaceEnhancer:
         fallback-safe: returns input if anything is off
         """
 
-        # --- Shape validation ---
         if img512 is None:
             print("[GFPGAN] Input is None")
             return img512
@@ -37,10 +60,8 @@ class FaceEnhancer:
             face = np.transpose(face, (2, 0, 1))  # CHW
             face = np.expand_dims(face, 0)        # 1x3x512x512
 
-            # Inference
             out = self.sess.run(None, {self.input_name: face})[0]
 
-            # Postprocessing
             out = np.squeeze(out)
             out = np.transpose(out, (1, 2, 0))
             out = np.clip(out * 255.0, 0, 255).astype(np.uint8)
