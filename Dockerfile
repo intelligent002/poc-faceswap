@@ -1,21 +1,41 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Системные зависимости
-RUN apt-get update && apt-get install -y \
+# ===== Install system deps =====
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    curl \
+    git \
     libgl1 \
     libglib2.0-0 \
- && rm -rf /var/lib/apt/lists/*
+    libopencv-core-dev \
+    libopencv-highgui-dev \
+    libopencv-imgproc-dev \
+    libopencv-videoio-dev \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
 
+# ===== Create working directory =====
+WORKDIR /app
+
+# ===== Copy Python dependencies =====
 COPY requirements.txt .
+
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app ./app
+# ===== Copy application =====
 COPY models ./models
+COPY app ./app
 
-ENV PYTHONUNBUFFERED=1
-
+# ===== Expose port =====
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# ===== Runtime arguments (optimize threading) =====
+ENV OMP_NUM_THREADS=8
+ENV OPENBLAS_NUM_THREADS=8
+ENV MKL_NUM_THREADS=8
+
+# ===== Run server =====
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

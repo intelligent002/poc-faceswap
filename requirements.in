@@ -1,9 +1,12 @@
 fastapi
+httptools
 insightface
-numpy
 onnxruntime
 opencv-python
 opencv-python-headless
-pillow
+pip-tools
+python-dotenv
 python-multipart
-uvicorn[standard]
+uvicorn
+watchfiles
+websockets
